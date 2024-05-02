@@ -56,10 +56,7 @@ impl fmt::Display for Error {
             Error::InvalidCharacter(offset) => write!(f, "invalid character at {}", offset),
             Error::NumberExpected(offset) => write!(f, "expected number at {}", offset),
             Error::UnknownUnit { unit, value, .. } if unit.is_empty() => {
-                write!(f,
-                    "time unit needed, for example {0}sec or {0}ms",
-                    value,
-                )
+                write!(f, "time unit needed, for example {0}sec or {0}ms", value,)
             }
             Error::UnknownUnit { unit, .. } => {
                 write!(
@@ -94,13 +91,17 @@ impl OverflowOp for u64 {
     }
 }
 
-struct Parser<'a> {
+struct Parser<'a, AFn> {
     iter: Chars<'a>,
     src: &'a str,
     current: (u64, u64),
+    unit_handler: AFn,
 }
 
-impl<'a> Parser<'a> {
+impl<'a, AFn> Parser<'a, AFn>
+where
+    AFn: FnMut(&'a str, u64) -> Result<Option<u64>, Error>,
+{
     fn off(&self) -> usize {
         self.src.len() - self.iter.as_str().len()
     }
@@ -120,27 +121,29 @@ impl<'a> Parser<'a> {
         }
         Ok(None)
     }
-    fn parse_unit(&mut self, n: u64, start: usize, end: usize)
-        -> Result<(), Error>
-    {
+    fn parse_unit(&mut self, n: u64, start: usize, end: usize) -> Result<(), Error> {
         let (mut sec, nsec) = match &self.src[start..end] {
             "nanos" | "nsec" | "ns" => (0u64, n),
             "usec" | "us" => (0u64, n.mul(1000)?),
             "millis" | "msec" | "ms" => (0u64, n.mul(1_000_000)?),
             "seconds" | "second" | "secs" | "sec" | "s" => (n, 0),
-            "minutes" | "minute" | "min" | "mins" | "m"
-            => (n.mul(60)?, 0),
+            "minutes" | "minute" | "min" | "mins" | "m" => (n.mul(60)?, 0),
             "hours" | "hour" | "hr" | "hrs" | "h" => (n.mul(3600)?, 0),
             "days" | "day" | "d" => (n.mul(86400)?, 0),
-            "weeks" | "week" | "w" => (n.mul(86400*7)?, 0),
+            "weeks" | "week" | "w" => (n.mul(86400 * 7)?, 0),
             "months" | "month" | "M" => (n.mul(2_630_016)?, 0), // 30.44d
-            "years" | "year" | "y" => (n.mul(31_557_600)?, 0), // 365.25d
+            "years" | "year" | "y" => (n.mul(31_557_600)?, 0),  // 365.25d
             _ => {
-                return Err(Error::UnknownUnit {
-                    start, end,
-                    unit: self.src[start..end].to_string(),
-                    value: n,
-                });
+                if let Some(n) = (self.unit_handler)(&self.src[start..end], n)? {
+                    (0, n)
+                } else {
+                    return Err(Error::UnknownUnit {
+                        start,
+                        end,
+                        unit: self.src[start..end].to_string(),
+                        value: n,
+                    });
+                }
             }
         };
         let mut nsec = self.current.1.add(nsec)?;
@@ -160,7 +163,8 @@ impl<'a> Parser<'a> {
             while let Some(c) = self.iter.next() {
                 match c {
                     '0'..='9' => {
-                        n = n.checked_mul(10)
+                        n = n
+                            .checked_mul(10)
                             .and_then(|x| x.checked_add(c as u64 - '0' as u64))
                             .ok_or(Error::NumberOverflow)?;
                     }
@@ -194,12 +198,10 @@ impl<'a> Parser<'a> {
             self.parse_unit(n, start, off)?;
             n = match self.parse_first_char()? {
                 Some(n) => n,
-                None => return Ok(
-                    Duration::new(self.current.0, self.current.1 as u32)),
+                None => return Ok(Duration::new(self.current.0, self.current.1 as u32)),
             };
         }
     }
-
 }
 
 /// Parse duration object `1hour 12min 5s`
@@ -232,7 +234,54 @@ pub fn parse_duration(s: &str) -> Result<Duration, Error> {
         iter: s.chars(),
         src: s,
         current: (0, 0),
-    }.parse()
+        unit_handler: |_, _| Ok(None),
+    }
+    .parse()
+}
+
+/// Parse duration object `1hour 12min 5s` with custom unit support.
+///
+/// The duration object is a concatenation of time spans. Where each time
+/// span is an integer number and a suffix. Supported suffixes:
+///
+/// * `nsec`, `ns` -- nanoseconds
+/// * `usec`, `us` -- microseconds
+/// * `msec`, `ms` -- milliseconds
+/// * `seconds`, `second`, `sec`, `s`
+/// * `minutes`, `minute`, `min`, `m`
+/// * `hours`, `hour`, `hr`, `h`
+/// * `days`, `day`, `d`
+/// * `weeks`, `week`, `w`
+/// * `months`, `month`, `M` -- defined as 30.44 days
+/// * `years`, `year`, `y` -- defined as 365.25 days
+///
+/// This method differs from [`parse_duration`] by allowing a custom unit
+/// handler to add units to your project.
+///
+/// # Examples
+///
+/// ```
+/// use std::time::Duration;
+/// use humantime::parse_duration_ex;
+///
+/// assert_eq!(parse_duration_ex("2h 37min 4custom", |u, n| {
+///   if u == "custom" { Ok(Some(n * 123)) } else { Ok(None) }
+/// }), Ok(Duration::new(9420, 492)));
+/// assert!(parse_duration_ex("2h 37min 4custom", |u, n| {
+///   Ok(None)
+/// }).is_err());
+/// ```
+pub fn parse_duration_ex<Handler>(s: &str, unit_handler: Handler) -> Result<Duration, Error>
+where
+    Handler: FnMut(&str, u64) -> Result<Option<u64>, Error>,
+{
+    Parser {
+        iter: s.chars(),
+        src: s,
+        current: (0, 0),
+        unit_handler,
+    }
+    .parse()
 }
 
 /// Formats duration into a human-readable string
@@ -256,10 +305,7 @@ pub fn format_duration(val: Duration) -> FormattedDuration {
     FormattedDuration(val)
 }
 
-fn item_plural(f: &mut fmt::Formatter, started: &mut bool,
-    name: &str, value: u64)
-    -> fmt::Result
-{
+fn item_plural(f: &mut fmt::Formatter, started: &mut bool, name: &str, value: u64) -> fmt::Result {
     if value > 0 {
         if *started {
             f.write_str(" ")?;
@@ -272,9 +318,7 @@ fn item_plural(f: &mut fmt::Formatter, started: &mut bool,
     }
     Ok(())
 }
-fn item(f: &mut fmt::Formatter, started: &mut bool, name: &str, value: u32)
-    -> fmt::Result
-{
+fn item(f: &mut fmt::Formatter, started: &mut bool, name: &str, value: u32) -> fmt::Result {
     if value > 0 {
         if *started {
             f.write_str(" ")?;
@@ -302,9 +346,9 @@ impl fmt::Display for FormattedDuration {
             return Ok(());
         }
 
-        let years = secs / 31_557_600;  // 365.25d
+        let years = secs / 31_557_600; // 365.25d
         let ydays = secs % 31_557_600;
-        let months = ydays / 2_630_016;  // 30.44d
+        let months = ydays / 2_630_016; // 30.44d
         let mdays = ydays % 2_630_016;
         let days = mdays / 86400;
         let day_secs = mdays % 86400;
@@ -336,8 +380,8 @@ mod test {
 
     use rand::Rng;
 
-    use super::{parse_duration, format_duration};
     use super::Error;
+    use super::{format_duration, parse_duration};
 
     #[test]
     #[allow(clippy::cognitive_complexity)]
@@ -372,25 +416,34 @@ mod test {
         assert_eq!(parse_duration("7weeks"), Ok(Duration::new(4_233_600, 0)));
         assert_eq!(parse_duration("52w"), Ok(Duration::new(31_449_600, 0)));
         assert_eq!(parse_duration("1month"), Ok(Duration::new(2_630_016, 0)));
-        assert_eq!(parse_duration("3months"), Ok(Duration::new(3*2_630_016, 0)));
+        assert_eq!(
+            parse_duration("3months"),
+            Ok(Duration::new(3 * 2_630_016, 0))
+        );
         assert_eq!(parse_duration("12M"), Ok(Duration::new(31_560_192, 0)));
         assert_eq!(parse_duration("1year"), Ok(Duration::new(31_557_600, 0)));
-        assert_eq!(parse_duration("7years"), Ok(Duration::new(7*31_557_600, 0)));
+        assert_eq!(
+            parse_duration("7years"),
+            Ok(Duration::new(7 * 31_557_600, 0))
+        );
         assert_eq!(parse_duration("17y"), Ok(Duration::new(536_479_200, 0)));
     }
 
     #[test]
     fn test_combo() {
-        assert_eq!(parse_duration("20 min 17 nsec "), Ok(Duration::new(1200, 17)));
+        assert_eq!(
+            parse_duration("20 min 17 nsec "),
+            Ok(Duration::new(1200, 17))
+        );
         assert_eq!(parse_duration("2h 15m"), Ok(Duration::new(8100, 0)));
     }
 
     #[test]
     fn all_86400_seconds() {
-        for second in 0..86400 {  // scan leap year and non-leap year
+        for second in 0..86400 {
+            // scan leap year and non-leap year
             let d = Duration::new(second, 0);
-            assert_eq!(d,
-                parse_duration(&format_duration(d).to_string()).unwrap());
+            assert_eq!(d, parse_duration(&format_duration(d).to_string()).unwrap());
         }
     }
 
@@ -399,8 +452,7 @@ mod test {
         for _ in 0..10000 {
             let sec = rand::thread_rng().gen_range(0, 253_370_764_800);
             let d = Duration::new(sec, 0);
-            assert_eq!(d,
-                parse_duration(&format_duration(d).to_string()).unwrap());
+            assert_eq!(d, parse_duration(&format_duration(d).to_string()).unwrap());
         }
     }
 
@@ -410,8 +462,7 @@ mod test {
             let sec = rand::thread_rng().gen_range(0, 253_370_764_800);
             let nanos = rand::thread_rng().gen_range(0, 1_000_000_000);
             let d = Duration::new(sec, nanos);
-            assert_eq!(d,
-                parse_duration(&format_duration(d).to_string()).unwrap());
+            assert_eq!(d, parse_duration(&format_duration(d).to_string()).unwrap());
         }
     }
 
@@ -419,38 +470,64 @@ mod test {
     fn test_overlow() {
         // Overflow on subseconds is earlier because of how we do conversion
         // we could fix it, but I don't see any good reason for this
-        assert_eq!(parse_duration("100000000000000000000ns"),
-            Err(Error::NumberOverflow));
-        assert_eq!(parse_duration("100000000000000000us"),
-            Err(Error::NumberOverflow));
-        assert_eq!(parse_duration("100000000000000ms"),
-            Err(Error::NumberOverflow));
+        assert_eq!(
+            parse_duration("100000000000000000000ns"),
+            Err(Error::NumberOverflow)
+        );
+        assert_eq!(
+            parse_duration("100000000000000000us"),
+            Err(Error::NumberOverflow)
+        );
+        assert_eq!(
+            parse_duration("100000000000000ms"),
+            Err(Error::NumberOverflow)
+        );
 
-        assert_eq!(parse_duration("100000000000000000000s"),
-            Err(Error::NumberOverflow));
-        assert_eq!(parse_duration("10000000000000000000m"),
-            Err(Error::NumberOverflow));
-        assert_eq!(parse_duration("1000000000000000000h"),
-            Err(Error::NumberOverflow));
-        assert_eq!(parse_duration("100000000000000000d"),
-            Err(Error::NumberOverflow));
-        assert_eq!(parse_duration("10000000000000000w"),
-            Err(Error::NumberOverflow));
-        assert_eq!(parse_duration("1000000000000000M"),
-            Err(Error::NumberOverflow));
-        assert_eq!(parse_duration("10000000000000y"),
-            Err(Error::NumberOverflow));
+        assert_eq!(
+            parse_duration("100000000000000000000s"),
+            Err(Error::NumberOverflow)
+        );
+        assert_eq!(
+            parse_duration("10000000000000000000m"),
+            Err(Error::NumberOverflow)
+        );
+        assert_eq!(
+            parse_duration("1000000000000000000h"),
+            Err(Error::NumberOverflow)
+        );
+        assert_eq!(
+            parse_duration("100000000000000000d"),
+            Err(Error::NumberOverflow)
+        );
+        assert_eq!(
+            parse_duration("10000000000000000w"),
+            Err(Error::NumberOverflow)
+        );
+        assert_eq!(
+            parse_duration("1000000000000000M"),
+            Err(Error::NumberOverflow)
+        );
+        assert_eq!(
+            parse_duration("10000000000000y"),
+            Err(Error::NumberOverflow)
+        );
     }
 
     #[test]
     fn test_nice_error_message() {
-        assert_eq!(parse_duration("123").unwrap_err().to_string(),
-            "time unit needed, for example 123sec or 123ms");
-        assert_eq!(parse_duration("10 months 1").unwrap_err().to_string(),
-            "time unit needed, for example 1sec or 1ms");
-        assert_eq!(parse_duration("10nights").unwrap_err().to_string(),
+        assert_eq!(
+            parse_duration("123").unwrap_err().to_string(),
+            "time unit needed, for example 123sec or 123ms"
+        );
+        assert_eq!(
+            parse_duration("10 months 1").unwrap_err().to_string(),
+            "time unit needed, for example 1sec or 1ms"
+        );
+        assert_eq!(
+            parse_duration("10nights").unwrap_err().to_string(),
             "unknown time unit \"nights\", supported units: \
             ns, us, ms, sec, min, hours, days, weeks, months, \
-            years (and few variations)");
+            years (and few variations)"
+        );
     }
 }
